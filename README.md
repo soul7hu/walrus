@@ -32,6 +32,7 @@ You are responsible for using it in a way that respects platform rules, local la
 ## Requirements
 
 - Python 3.9+
+- 7-Zip (`7z` command)
 - Telegram `API_ID`
 - Telegram `API_HASH`
 - Telegram bot token
@@ -41,7 +42,7 @@ You are responsible for using it in a way that respects platform rules, local la
 ## Installation
 
 ```bash
-git clone https://github.com/rezaaa/walrus.git
+git clone https://github.com/soul7hu/walrus.git
 cd walrus
 cp .env.example .env
 ```
@@ -57,6 +58,7 @@ BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_SESSION=walrus
 RUBIKA_SESSION=rubsession
 OWNER_TELEGRAM_ID=123456789
+MAX_RUBIKA_FILE_SIZE_MB=80
 ```
 
 Variables:
@@ -67,6 +69,7 @@ Variables:
 - `TELEGRAM_SESSION` - optional Pyrogram session name; defaults to `walrus`
 - `RUBIKA_SESSION` - session name or path used by `rubpy`
 - `OWNER_TELEGRAM_ID` - optional; if set, only this Telegram user ID can use the bot
+`MAX_RUBIKA_FILE_SIZE_MB` - maximum Rubika upload volume size in MiB; files larger than this are automatically split into Store-mode 7-Zip volumes
 
 `TELEGRAM_SESSION` controls the Telegram/Pyrogram session file name, such as `walrus.session`.
 `RUBIKA_SESSION` controls the session file name that `rubpy` uses on disk, such as `rubsession.rp`.
@@ -79,6 +82,8 @@ How to get your Telegram user ID:
 
 Then put that number into `.env` as `OWNER_TELEGRAM_ID`.
 If you leave it unset, the bot stays open for everyone.
+
+For large files, Walrus automatically creates Store-mode 7-Zip multi-volume archives when the file exceeds `MAX_RUBIKA_FILE_SIZE_MB`. The resulting files are named like `filename.7z.001`, `filename.7z.002`, and so on. Download all volumes and open the `.7z.001` file with WinRAR or 7-Zip to recover the original file.
 
 ## Setup
 
@@ -110,14 +115,14 @@ After a successful login, the current Rubika session is replaced and reused by t
 Install the system packages once:
 
 ```bash
-apt update && apt install -y git python3 python3-venv screen
+apt update && apt install -y git python3 python3-venv screen 7zip
 ```
 
 Clone Walrus and configure `.env`:
 
 ```bash
 cd /opt
-git clone https://github.com/rezaaa/walrus.git
+git clone https://github.com/soul7hu/walrus.git
 cd /opt/walrus
 cp .env.example .env
 nano .env
@@ -129,7 +134,7 @@ Run the setup script:
 bash update.sh
 ```
 
-`update.sh` creates `venv/` if needed, installs dependencies, stops any old `walrus` screen session, and starts the app in a new screen session.
+`update.sh` installs missing system requirements when needed, including 7-Zip, creates `venv/` if needed, installs Python dependencies, stops any old `walrus` screen session, and starts the app in a new screen session.
 
 Verify or attach to the running app:
 

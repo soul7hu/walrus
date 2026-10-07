@@ -32,6 +32,7 @@ Walrus یک ربات تلگرام است که فایل‌ها را از تلگر
 ## پیش‌نیازها
 
 - Python 3.9 یا جدیدتر
+- 7-Zip (دستور `7z`)
 - `API_ID` تلگرام
 - `API_HASH` تلگرام
 - توکن ربات تلگرام
@@ -39,7 +40,7 @@ Walrus یک ربات تلگرام است که فایل‌ها را از تلگر
 ## نصب
 
 ```bash
-git clone https://github.com/rezaaa/walrus.git
+git clone https://github.com/soul7hu/walrus.git
 cd walrus
 cp .env.example .env
 ```
@@ -55,6 +56,7 @@ BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_SESSION=walrus
 RUBIKA_SESSION=rubsession
 OWNER_TELEGRAM_ID=123456789
+MAX_RUBIKA_FILE_SIZE_MB=80
 ```
 
 متغیرها:
@@ -108,14 +110,14 @@ Walrus راه‌اندازی حساب روبیکا را از داخل تلگرا
 یک‌بار پکیج‌های سیستمی را نصب کنید:
 
 ```bash
-apt update && apt install -y git python3 python3-venv screen
+apt update && apt install -y git python3 python3-venv screen 7zip
 ```
 
 پروژه را کلون و `.env` را تنظیم کنید:
 
 ```bash
 cd /opt
-git clone https://github.com/rezaaa/walrus.git
+git clone https://github.com/soul7hu/walrus.git
 cd /opt/walrus
 cp .env.example .env
 nano .env
