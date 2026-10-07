@@ -33,6 +33,7 @@ from task_store import (
     append_task,
     build_status_text,
     cleanup_local_file,
+    clear_failed_history,
     ensure_storage_dirs,
     find_failed_entry,
     has_rubika_session,
@@ -1209,10 +1210,11 @@ async def send_transfers_summary(message: Message) -> None:
 
 async def send_cleanup_preview(message: Message) -> None:
     candidates = cleanup_candidates()
+    has_failed_history = bool(read_failed_entries())
     await message.reply_text(
         build_cleanup_preview(),
         parse_mode=enums.ParseMode.HTML,
-        reply_markup=cleanup_keyboard(bool(candidates)),
+        reply_markup=cleanup_keyboard(bool(candidates) or has_failed_history),
     )
 
 
@@ -1220,6 +1222,8 @@ async def run_cleanup(message: Message) -> None:
     candidates = cleanup_candidates()
     total_size = sum_file_sizes(candidates)
     removed_count = 0
+    failed_entries = read_failed_entries()
+    failed_count = len(failed_entries)
 
     for path in candidates:
         try:
@@ -1228,6 +1232,13 @@ async def run_cleanup(message: Message) -> None:
         except OSError:
             pass
 
+    failed_cleanup_error = None
+
+    try:
+        clear_failed_history()
+    except Exception as exc:
+        failed_cleanup_error = str(exc)
+
     await message.reply_text(
         "\n".join(
             [
@@ -1235,6 +1246,11 @@ async def run_cleanup(message: Message) -> None:
                 "",
                 f"Removed files: <b>{removed_count}</b>",
                 f"Freed space: <b>{human_size(total_size)}</b>",
+                (
+                    f"Cleared failed history: <b>{failed_count}</b>"
+                    if failed_cleanup_error is None
+                    else f"⚠ <b>Failed history cleanup error:</b> {ltr_code(failed_cleanup_error)}"
+                ),
             ]
         ),
         parse_mode=enums.ParseMode.HTML,
@@ -1322,11 +1338,13 @@ def build_transfers_summary() -> str:
 def build_cleanup_preview() -> str:
     candidates = cleanup_candidates()
     total_size = sum_file_sizes(candidates)
+    failed_count = len(read_failed_entries())
     lines = [
         "<b>🧹 Downloads Cleanup</b>",
         "",
         f"🗑 <b>Files to remove:</b> {ltr_code(str(len(candidates)))}",
         f"💾 <b>Space to free:</b> {ltr_code(human_size(total_size))}",
+        f"❌ <b>Failed history entries:</b> {ltr_code(str(failed_count))}",
     ]
 
     if candidates:
@@ -1334,6 +1352,14 @@ def build_cleanup_preview() -> str:
             [
                 "",
                 "These files are not active, queued, or processing.",
+            ]
+        )
+    elif failed_count:
+        lines.extend(
+            [
+                "",
+                "No downloaded files to remove.",
+                "Failed transfer history can still be cleared.",
             ]
         )
     else:
