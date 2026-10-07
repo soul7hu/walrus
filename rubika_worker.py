@@ -4,6 +4,8 @@ import asyncio
 import atexit
 from html import escape
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -379,71 +381,6 @@ def compact_error_text(error: Exception | str) -> str:
     return text[: ERROR_TEXT_LIMIT - 3].rstrip() + "..."
 
 
-def split_file_for_rubika(file_path: str, part_size: int) -> list[str]:
-    """Split a file into sequential binary parts without loading it into RAM."""
-    source = Path(file_path)
-
-    if not source.exists():
-        raise FileNotFoundError(f"File not found: {source}")
-
-    if part_size <= 0:
-        raise ValueError("part_size must be greater than zero.")
-
-    file_size = source.stat().st_size
-
-    if file_size <= part_size:
-        return [str(source)]
-
-    parts = []
-    part_number = 1
-    remaining = file_size
-    buffer_size = 1024 * 1024  # 1 MiB
-
-    while remaining > 0:
-        part_path = source.with_name(
-            f"{source.name}.part{part_number:03d}"
-        )
-
-        try:
-            bytes_to_write = min(part_size, remaining)
-
-            with source.open("rb") as src, part_path.open("wb") as dst:
-                src.seek(file_size - remaining)
-
-                remaining_for_part = bytes_to_write
-
-                while remaining_for_part > 0:
-                    chunk = src.read(min(buffer_size, remaining_for_part))
-
-                    if not chunk:
-                        raise IOError(
-                            f"Unexpected end of source file while creating {part_path.name}."
-                        )
-
-                    dst.write(chunk)
-                    remaining_for_part -= len(chunk)
-
-            parts.append(str(part_path))
-            remaining -= bytes_to_write
-            part_number += 1
-
-        except Exception:
-            for created_part in parts:
-                try:
-                    Path(created_part).unlink()
-                except OSError:
-                    pass
-
-            try:
-                part_path.unlink()
-            except OSError:
-                pass
-
-            raise
-
-    return parts
-
-
 def build_fallback_upload_name(task: dict, file_path: str, current_name: str | None = None) -> str:
     original_suffix = Path(current_name or file_path).suffix.lower()
     suffix = original_suffix if original_suffix in UPLOAD_EXTENSIONS else ".bin"
@@ -662,12 +599,73 @@ def send_with_retry(
     raise last_error if last_error else RuntimeError("Upload failed.")
 
 
-def cleanup_split_parts(file_path: str) -> None:
-    """Remove generated split parts belonging to a source file."""
+
+
+def split_file_for_rubika(file_path: str, part_size: int) -> list[str]:
+    """Create a Store-mode 7-Zip multi-volume archive for Rubika upload."""
     source = Path(file_path)
 
-    for part_path in source.parent.glob(f"{source.name}.part[0-9][0-9][0-9]"):
-        cleanup_local_file(str(part_path))
+    if not source.exists():
+        raise FileNotFoundError(f"File not found: {source}")
+
+    if part_size <= 0:
+        raise ValueError("part_size must be greater than zero.")
+
+    if not shutil.which("7z"):
+        raise RuntimeError("7z is required for large-file splitting but was not found.")
+
+    volume_size_mb = max(1, part_size // (1024 * 1024))
+    archive_base = source.with_name(f"{source.name}.7z")
+
+    cleanup_split_parts(str(source))
+
+    command = [
+        "7z",
+        "a",
+        "-t7z",
+        "-mx=0",
+        f"-v{volume_size_mb}m",
+        str(archive_base),
+        str(source),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        cleanup_split_parts(str(source))
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"7-Zip failed with exit code {result.returncode}: {details[-500:]}"
+        )
+
+    parts = sorted(
+        str(part)
+        for part in source.parent.glob(f"{source.name}.7z.[0-9][0-9][0-9]")
+    )
+
+    if not parts:
+        cleanup_split_parts(str(source))
+        raise RuntimeError("7-Zip completed but no archive volumes were created.")
+
+    return parts
+
+def cleanup_split_parts(file_path: str) -> None:
+    """Remove generated 7-Zip volumes belonging to a source file."""
+    source = Path(file_path)
+
+    patterns = [
+        f"{source.name}.7z.[0-9][0-9][0-9]",
+        f"{source.name}.7z",
+        f"{source.name}.part[0-9][0-9][0-9]",
+    ]
+
+    for pattern in patterns:
+        for part_path in source.parent.glob(pattern):
+            cleanup_local_file(str(part_path))
 
 
 def upload_file_with_optional_splitting(
@@ -678,7 +676,7 @@ def upload_file_with_optional_splitting(
     caption: str,
     file_name: str,
 ) -> None:
-    """Upload a file normally or split it into Rubika-safe parts when necessary."""
+    """Upload a file normally or as 7-Zip Store-mode volumes."""
     source = Path(file_path)
     file_size = source.stat().st_size
 
@@ -695,10 +693,11 @@ def upload_file_with_optional_splitting(
 
     update_telegram_status(
         task,
-        stage="✂️ Splitting File",
+        stage="📦 Creating 7-Zip Volumes",
         upload_status=(
             f"File is {file_size / (1024 ** 3):.2f} GB. "
-            f"Splitting into parts of up to {MAX_RUBIKA_FILE_SIZE_MB:g} MB."
+            f"Creating Store-mode 7-Zip volumes of "
+            f"{MAX_RUBIKA_FILE_SIZE_MB:g} MiB."
         ),
         attempt_text=None,
     )
@@ -713,22 +712,25 @@ def upload_file_with_optional_splitting(
     try:
         for index, part_path in enumerate(parts, start=1):
             if is_cancelled(task.get("task_id", "")):
-                raise CancelledTaskError("Cancelled before the next upload part.")
+                raise CancelledTaskError(
+                    "Cancelled before the next archive volume upload."
+                )
 
-            part_file_name = f"{file_name}.part{index:03d}"
+            part_file_name = Path(part_path).name
 
             part_caption = (
-                f"{caption}\n\nPart {index}/{total_parts}"
+                f"{caption}\n\n"
+                f"Archive volume {index}/{total_parts}"
                 if caption and caption.strip()
-                else f"Part {index}/{total_parts}"
+                else f"Archive volume {index}/{total_parts}"
             )
 
             update_telegram_status(
                 task,
-                stage=f"📤 Uploading Part {index}/{total_parts}",
+                stage=f"📤 Uploading Volume {index}/{total_parts}",
                 upload_status=(
-                    f"Uploading part {index} of {total_parts} "
-                    f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MB)."
+                    f"Uploading 7-Zip volume {index} of {total_parts} "
+                    f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MiB)."
                 ),
                 attempt_text=None,
             )
@@ -743,14 +745,10 @@ def upload_file_with_optional_splitting(
             )
 
     except Exception:
-        # The original file is deliberately preserved so the task can
-        # be retried without downloading it again. Temporary parts are
-        # removed because they can safely be recreated from the original.
         cleanup_split_parts(str(source))
         raise
 
     cleanup_split_parts(str(source))
-
 
 def process_task(task: dict) -> None:
     task_type = task.get("type")
