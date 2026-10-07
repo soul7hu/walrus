@@ -45,6 +45,12 @@ RUBIKA_CONNECT_TIMEOUT = int(os.getenv("RUBIKA_CONNECT_TIMEOUT", "25") or 25)
 RUBIKA_FINALIZE_RETRIES = int(os.getenv("RUBIKA_FINALIZE_RETRIES", "3") or 3)
 RUBIKA_FINALIZE_RETRY_DELAY = float(os.getenv("RUBIKA_FINALIZE_RETRY_DELAY", "2") or 2)
 
+# Maximum size of each Rubika upload part.
+# 900 MB gives us some safety margin below a possible server-side limit.
+MAX_RUBIKA_FILE_SIZE_MB = float(os.getenv("MAX_RUBIKA_FILE_SIZE_MB", "900") or 900)
+MAX_RUBIKA_FILE_SIZE = int(MAX_RUBIKA_FILE_SIZE_MB * 1024 * 1024)
+
+
 ensure_storage_dirs()
 
 
@@ -373,6 +379,71 @@ def compact_error_text(error: Exception | str) -> str:
     return text[: ERROR_TEXT_LIMIT - 3].rstrip() + "..."
 
 
+def split_file_for_rubika(file_path: str, part_size: int) -> list[str]:
+    """Split a file into sequential binary parts without loading it into RAM."""
+    source = Path(file_path)
+
+    if not source.exists():
+        raise FileNotFoundError(f"File not found: {source}")
+
+    if part_size <= 0:
+        raise ValueError("part_size must be greater than zero.")
+
+    file_size = source.stat().st_size
+
+    if file_size <= part_size:
+        return [str(source)]
+
+    parts = []
+    part_number = 1
+    remaining = file_size
+    buffer_size = 1024 * 1024  # 1 MiB
+
+    while remaining > 0:
+        part_path = source.with_name(
+            f"{source.name}.part{part_number:03d}"
+        )
+
+        try:
+            bytes_to_write = min(part_size, remaining)
+
+            with source.open("rb") as src, part_path.open("wb") as dst:
+                src.seek(file_size - remaining)
+
+                remaining_for_part = bytes_to_write
+
+                while remaining_for_part > 0:
+                    chunk = src.read(min(buffer_size, remaining_for_part))
+
+                    if not chunk:
+                        raise IOError(
+                            f"Unexpected end of source file while creating {part_path.name}."
+                        )
+
+                    dst.write(chunk)
+                    remaining_for_part -= len(chunk)
+
+            parts.append(str(part_path))
+            remaining -= bytes_to_write
+            part_number += 1
+
+        except Exception:
+            for created_part in parts:
+                try:
+                    Path(created_part).unlink()
+                except OSError:
+                    pass
+
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+
+            raise
+
+    return parts
+
+
 def build_fallback_upload_name(task: dict, file_path: str, current_name: str | None = None) -> str:
     original_suffix = Path(current_name or file_path).suffix.lower()
     suffix = original_suffix if original_suffix in UPLOAD_EXTENSIONS else ".bin"
@@ -591,6 +662,96 @@ def send_with_retry(
     raise last_error if last_error else RuntimeError("Upload failed.")
 
 
+def cleanup_split_parts(file_path: str) -> None:
+    """Remove generated split parts belonging to a source file."""
+    source = Path(file_path)
+
+    for part_path in source.parent.glob(f"{source.name}.part[0-9][0-9][0-9]"):
+        cleanup_local_file(str(part_path))
+
+
+def upload_file_with_optional_splitting(
+    task: dict,
+    session_name: str,
+    target: str,
+    file_path: str,
+    caption: str,
+    file_name: str,
+) -> None:
+    """Upload a file normally or split it into Rubika-safe parts when necessary."""
+    source = Path(file_path)
+    file_size = source.stat().st_size
+
+    if file_size <= MAX_RUBIKA_FILE_SIZE:
+        send_with_retry(
+            task,
+            session_name,
+            target,
+            str(source),
+            caption,
+            file_name=file_name,
+        )
+        return
+
+    update_telegram_status(
+        task,
+        stage="✂️ Splitting File",
+        upload_status=(
+            f"File is {file_size / (1024 ** 3):.2f} GB. "
+            f"Splitting into parts of up to {MAX_RUBIKA_FILE_SIZE_MB:g} MB."
+        ),
+        attempt_text=None,
+    )
+
+    parts = split_file_for_rubika(
+        str(source),
+        MAX_RUBIKA_FILE_SIZE,
+    )
+
+    total_parts = len(parts)
+
+    try:
+        for index, part_path in enumerate(parts, start=1):
+            if is_cancelled(task.get("task_id", "")):
+                raise CancelledTaskError("Cancelled before the next upload part.")
+
+            part_file_name = f"{file_name}.part{index:03d}"
+
+            part_caption = (
+                f"{caption}\n\nPart {index}/{total_parts}"
+                if caption and caption.strip()
+                else f"Part {index}/{total_parts}"
+            )
+
+            update_telegram_status(
+                task,
+                stage=f"📤 Uploading Part {index}/{total_parts}",
+                upload_status=(
+                    f"Uploading part {index} of {total_parts} "
+                    f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MB)."
+                ),
+                attempt_text=None,
+            )
+
+            send_with_retry(
+                task,
+                session_name,
+                target,
+                part_path,
+                part_caption,
+                file_name=part_file_name,
+            )
+
+    except Exception:
+        # The original file is deliberately preserved so the task can
+        # be retried without downloading it again. Temporary parts are
+        # removed because they can safely be recreated from the original.
+        cleanup_split_parts(str(source))
+        raise
+
+    cleanup_split_parts(str(source))
+
+
 def process_task(task: dict) -> None:
     task_type = task.get("type")
     if task_type != "local_file":
@@ -609,6 +770,7 @@ def process_task(task: dict) -> None:
     task["rubika_target_type"] = settings["rubika_target_type"]
     send_path = original_path
     send_name = normalize_upload_filename(task.get("file_name") or original_path.name, original_path.name)
+    split_upload = original_path.stat().st_size > MAX_RUBIKA_FILE_SIZE
 
     try:
         if is_cancelled(task_id):
@@ -624,16 +786,17 @@ def process_task(task: dict) -> None:
         task["file_name"] = send_name
         save_processing(task)
 
-        send_with_retry(
+        upload_file_with_optional_splitting(
             task,
             settings["rubika_session"],
             settings["rubika_target"],
             str(send_path),
             caption,
-            file_name=send_name,
+            send_name,
         )
     except CancelledTaskError:
-        cleanup_local_file(str(send_path))
+        if not split_upload:
+            cleanup_local_file(str(send_path))
         clear_cancelled(task_id)
         update_telegram_status(
             task,
@@ -677,7 +840,13 @@ def recover_cancelled_processing_task() -> None:
     if not task_id or not is_cancelled(task_id):
         return
 
-    cleanup_local_file(task.get("path", ""))
+    task_path = Path(task.get("path", ""))
+
+    if task_path.exists() and task_path.stat().st_size > MAX_RUBIKA_FILE_SIZE:
+        cleanup_split_parts(str(task_path))
+    else:
+        cleanup_local_file(str(task_path))
+
     clear_cancelled(task_id)
     update_telegram_status(
         task,
