@@ -510,7 +510,7 @@ def send_with_retry(
     task_id = task.get("task_id", "")
     last_error = None
     upload_name = normalize_upload_filename(
-        task.get("upload_file_name") or file_name or Path(file_path).name,
+        file_name or task.get("upload_file_name") or Path(file_path).name,
         Path(file_path).name,
     )
     task["upload_file_name"] = upload_name
