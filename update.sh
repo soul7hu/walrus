@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/walrus}"
 BRANCH="${BRANCH:-main}"
-REPO_URL="${REPO_URL:-https://github.com/rezaaa/walrus.git}"
+REPO_URL="${REPO_URL:-https://github.com/soul7hu/walrus.git}"
 SCREEN_NAME="${SCREEN_NAME:-walrus}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_PYTHON="$APP_DIR/venv/bin/python"
