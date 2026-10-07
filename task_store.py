@@ -485,6 +485,12 @@ def read_failed_entries() -> list[dict]:
     return entries
 
 
+def clear_failed_history() -> None:
+    """Clear the persistent failed-transfer history."""
+    if FAILED_FILE.exists():
+        FAILED_FILE.unlink()
+
+
 def find_failed_entry(task_id: str) -> Optional[dict]:
     for entry in reversed(read_failed_entries()):
         task = entry.get("task") or {}
