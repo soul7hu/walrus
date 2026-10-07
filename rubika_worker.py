@@ -4,6 +4,8 @@ import asyncio
 import atexit
 from html import escape
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -44,6 +46,12 @@ ERROR_TEXT_LIMIT = 220
 RUBIKA_CONNECT_TIMEOUT = int(os.getenv("RUBIKA_CONNECT_TIMEOUT", "25") or 25)
 RUBIKA_FINALIZE_RETRIES = int(os.getenv("RUBIKA_FINALIZE_RETRIES", "3") or 3)
 RUBIKA_FINALIZE_RETRY_DELAY = float(os.getenv("RUBIKA_FINALIZE_RETRY_DELAY", "2") or 2)
+
+# Maximum size of each Rubika upload part.
+# 900 MB gives us some safety margin below a possible server-side limit.
+MAX_RUBIKA_FILE_SIZE_MB = float(os.getenv("MAX_RUBIKA_FILE_SIZE_MB", "900") or 900)
+MAX_RUBIKA_FILE_SIZE = int(MAX_RUBIKA_FILE_SIZE_MB * 1024 * 1024)
+
 
 ensure_storage_dirs()
 
@@ -591,6 +599,157 @@ def send_with_retry(
     raise last_error if last_error else RuntimeError("Upload failed.")
 
 
+
+
+def split_file_for_rubika(file_path: str, part_size: int) -> list[str]:
+    """Create a Store-mode 7-Zip multi-volume archive for Rubika upload."""
+    source = Path(file_path)
+
+    if not source.exists():
+        raise FileNotFoundError(f"File not found: {source}")
+
+    if part_size <= 0:
+        raise ValueError("part_size must be greater than zero.")
+
+    if not shutil.which("7z"):
+        raise RuntimeError("7z is required for large-file splitting but was not found.")
+
+    volume_size_mb = max(1, part_size // (1024 * 1024))
+    archive_base = source.with_name(f"{source.name}.7z")
+
+    cleanup_split_parts(str(source))
+
+    command = [
+        "7z",
+        "a",
+        "-t7z",
+        "-mx=0",
+        f"-v{volume_size_mb}m",
+        str(archive_base),
+        str(source),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        cleanup_split_parts(str(source))
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"7-Zip failed with exit code {result.returncode}: {details[-500:]}"
+        )
+
+    parts = sorted(
+        str(part)
+        for part in source.parent.glob(f"{source.name}.7z.[0-9][0-9][0-9]")
+    )
+
+    if not parts:
+        cleanup_split_parts(str(source))
+        raise RuntimeError("7-Zip completed but no archive volumes were created.")
+
+    return parts
+
+def cleanup_split_parts(file_path: str) -> None:
+    """Remove generated 7-Zip volumes belonging to a source file."""
+    source = Path(file_path)
+
+    patterns = [
+        f"{source.name}.7z.[0-9][0-9][0-9]",
+        f"{source.name}.7z",
+        f"{source.name}.part[0-9][0-9][0-9]",
+    ]
+
+    for pattern in patterns:
+        for part_path in source.parent.glob(pattern):
+            cleanup_local_file(str(part_path))
+
+
+def upload_file_with_optional_splitting(
+    task: dict,
+    session_name: str,
+    target: str,
+    file_path: str,
+    caption: str,
+    file_name: str,
+) -> None:
+    """Upload a file normally or as 7-Zip Store-mode volumes."""
+    source = Path(file_path)
+    file_size = source.stat().st_size
+
+    if file_size <= MAX_RUBIKA_FILE_SIZE:
+        send_with_retry(
+            task,
+            session_name,
+            target,
+            str(source),
+            caption,
+            file_name=file_name,
+        )
+        return
+
+    update_telegram_status(
+        task,
+        stage="📦 Creating 7-Zip Volumes",
+        upload_status=(
+            f"File is {file_size / (1024 ** 3):.2f} GB. "
+            f"Creating Store-mode 7-Zip volumes of "
+            f"{MAX_RUBIKA_FILE_SIZE_MB:g} MiB."
+        ),
+        attempt_text=None,
+    )
+
+    parts = split_file_for_rubika(
+        str(source),
+        MAX_RUBIKA_FILE_SIZE,
+    )
+
+    total_parts = len(parts)
+
+    try:
+        for index, part_path in enumerate(parts, start=1):
+            if is_cancelled(task.get("task_id", "")):
+                raise CancelledTaskError(
+                    "Cancelled before the next archive volume upload."
+                )
+
+            part_file_name = Path(part_path).name
+
+            part_caption = (
+                f"{caption}\n\n"
+                f"Archive volume {index}/{total_parts}"
+                if caption and caption.strip()
+                else f"Archive volume {index}/{total_parts}"
+            )
+
+            update_telegram_status(
+                task,
+                stage=f"📤 Uploading Volume {index}/{total_parts}",
+                upload_status=(
+                    f"Uploading 7-Zip volume {index} of {total_parts} "
+                    f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MiB)."
+                ),
+                attempt_text=None,
+            )
+
+            send_with_retry(
+                task,
+                session_name,
+                target,
+                part_path,
+                part_caption,
+                file_name=part_file_name,
+            )
+
+    except Exception:
+        cleanup_split_parts(str(source))
+        raise
+
+    cleanup_split_parts(str(source))
+
 def process_task(task: dict) -> None:
     task_type = task.get("type")
     if task_type != "local_file":
@@ -609,6 +768,7 @@ def process_task(task: dict) -> None:
     task["rubika_target_type"] = settings["rubika_target_type"]
     send_path = original_path
     send_name = normalize_upload_filename(task.get("file_name") or original_path.name, original_path.name)
+    split_upload = original_path.stat().st_size > MAX_RUBIKA_FILE_SIZE
 
     try:
         if is_cancelled(task_id):
@@ -624,16 +784,17 @@ def process_task(task: dict) -> None:
         task["file_name"] = send_name
         save_processing(task)
 
-        send_with_retry(
+        upload_file_with_optional_splitting(
             task,
             settings["rubika_session"],
             settings["rubika_target"],
             str(send_path),
             caption,
-            file_name=send_name,
+            send_name,
         )
     except CancelledTaskError:
-        cleanup_local_file(str(send_path))
+        if not split_upload:
+            cleanup_local_file(str(send_path))
         clear_cancelled(task_id)
         update_telegram_status(
             task,
@@ -677,7 +838,13 @@ def recover_cancelled_processing_task() -> None:
     if not task_id or not is_cancelled(task_id):
         return
 
-    cleanup_local_file(task.get("path", ""))
+    task_path = Path(task.get("path", ""))
+
+    if task_path.exists() and task_path.stat().st_size > MAX_RUBIKA_FILE_SIZE:
+        cleanup_split_parts(str(task_path))
+    else:
+        cleanup_local_file(str(task_path))
+
     clear_cancelled(task_id)
     update_telegram_status(
         task,
