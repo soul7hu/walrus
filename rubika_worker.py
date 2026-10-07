@@ -100,6 +100,12 @@ def resolve_task_settings(task: dict) -> dict:
             "rubika_target_type": (
                 task.get("rubika_target_type") or current_settings["rubika_target_type"]
             ),
+            "safe_mode": (
+                task.get("safe_mode")
+                if "safe_mode" in task
+                else current_settings["safe_mode"]
+            ),
+            "safe_mode_password": current_settings["safe_mode_password"],
         }
     )
 
@@ -601,6 +607,167 @@ def send_with_retry(
 
 
 
+def create_safe_mode_package(file_path: str, password: str) -> list[str]:
+    """Create a password-protected 7-Zip archive, optionally as Rubika-sized volumes."""
+    source = Path(file_path)
+
+    if not source.exists():
+        raise FileNotFoundError(f"File not found: {source}")
+
+    if not password:
+        raise ValueError("Safe Mode password is not configured.")
+
+    if not shutil.which("7z"):
+        raise RuntimeError("7z is required for Safe Mode but was not found.")
+
+    archive_path = source.with_name(f"{source.name}.7z")
+
+    def create_archive(volume: bool) -> list[str]:
+        cleanup_local_file(str(archive_path))
+        cleanup_split_parts(str(source))
+
+        command = [
+            "7z",
+            "a",
+            "-t7z",
+            "-mx=0",
+            "-mhe=on",
+            f"-p{password}",
+        ]
+
+        if volume:
+            volume_size_mb = max(1, MAX_RUBIKA_FILE_SIZE // (1024 * 1024))
+            command.append(f"-v{volume_size_mb}m")
+
+        command.extend(
+            [
+                str(archive_path),
+                str(source),
+            ]
+        )
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            cleanup_local_file(str(archive_path))
+            cleanup_split_parts(str(source))
+            details = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"7-Zip Safe Mode packaging failed with exit code "
+                f"{result.returncode}: {details[-500:]}"
+            )
+
+        if volume:
+            parts = sorted(
+                str(part)
+                for part in source.parent.glob(
+                    f"{source.name}.7z.[0-9][0-9][0-9]"
+                )
+            )
+
+            if not parts:
+                cleanup_local_file(str(archive_path))
+                cleanup_split_parts(str(source))
+                raise RuntimeError(
+                    "7-Zip completed but no Safe Mode archive volumes were created."
+                )
+
+            return parts
+
+        if not archive_path.exists():
+            raise RuntimeError(
+                "7-Zip completed but the Safe Mode archive was not created."
+            )
+
+        return [str(archive_path)]
+
+    # For clearly large files, create encrypted volumes directly.
+    if source.stat().st_size > MAX_RUBIKA_FILE_SIZE:
+        return create_archive(volume=True)
+
+    # Small files normally use one encrypted archive.
+    parts = create_archive(volume=False)
+
+    # If archive overhead pushes it above Rubika's limit, recreate it
+    # directly as encrypted volumes.
+    if Path(parts[0]).stat().st_size > MAX_RUBIKA_FILE_SIZE:
+        cleanup_local_file(parts[0])
+        return create_archive(volume=True)
+
+    return parts
+
+
+def upload_safe_mode_package(
+    task: dict,
+    session_name: str,
+    target: str,
+    parts: list[str],
+    caption: str,
+) -> None:
+    """Upload an already-created encrypted Safe Mode archive or its volumes."""
+    total_parts = len(parts)
+
+    try:
+        for index, part_path in enumerate(parts, start=1):
+            if is_cancelled(task.get("task_id", "")):
+                raise CancelledTaskError(
+                    "Cancelled before the next Safe Mode archive volume upload."
+                )
+
+            part_file_name = Path(part_path).name
+
+            part_caption = (
+                f"{caption}\n\n"
+                f"Archive volume {index}/{total_parts}"
+                if total_parts > 1 and caption and caption.strip()
+                else (
+                    f"Archive volume {index}/{total_parts}"
+                    if total_parts > 1
+                    else caption
+                )
+            )
+
+            update_telegram_status(
+                task,
+                stage=(
+                    f"📤 Uploading Volume {index}/{total_parts}"
+                    if total_parts > 1
+                    else "📤 Uploading Safe Mode Archive"
+                ),
+                upload_status=(
+                    f"Uploading encrypted Safe Mode archive volume "
+                    f"{index} of {total_parts} "
+                    f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MiB)."
+                    if total_parts > 1
+                    else (
+                        f"Uploading encrypted Safe Mode archive "
+                        f"({Path(part_path).stat().st_size / (1024 ** 2):.1f} MiB)."
+                    )
+                ),
+                attempt_text=None,
+            )
+
+            send_with_retry(
+                task,
+                session_name,
+                target,
+                part_path,
+                part_caption,
+                file_name=part_file_name,
+            )
+
+    except Exception:
+        for part_path in parts:
+            cleanup_local_file(part_path)
+        raise
+
+    for part_path in parts:
+        cleanup_local_file(part_path)
+
 def split_file_for_rubika(file_path: str, part_size: int) -> list[str]:
     """Create a Store-mode 7-Zip multi-volume archive for Rubika upload."""
     source = Path(file_path)
@@ -766,8 +933,26 @@ def process_task(task: dict) -> None:
     task["rubika_target"] = settings["rubika_target"]
     task["rubika_target_title"] = settings["rubika_target_title"]
     task["rubika_target_type"] = settings["rubika_target_type"]
+
+    safe_mode = bool(settings.get("safe_mode"))
+    safe_mode_password = settings.get("safe_mode_password", "")
+
     send_path = original_path
-    send_name = normalize_upload_filename(task.get("file_name") or original_path.name, original_path.name)
+    safe_mode_parts: list[str] = []
+
+    send_name = normalize_upload_filename(
+        task.get("file_name") or original_path.name,
+        original_path.name,
+    )
+
+    if safe_mode:
+        if not safe_mode_password:
+            raise RuntimeError(
+                "Safe Mode is enabled, but no Safe Mode password is configured."
+            )
+
+        send_name = f"{send_name}.7z"
+
     split_upload = original_path.stat().st_size > MAX_RUBIKA_FILE_SIZE
 
     try:
@@ -775,26 +960,72 @@ def process_task(task: dict) -> None:
             raise CancelledTaskError("Cancelled before upload started.")
 
         ensure_session(settings["rubika_session"])
-        update_telegram_status(
-            task,
-            stage="📤 Upload Queue",
-            upload_status=f"Preparing the file for upload to {format_destination_label(settings)}.",
-        )
 
-        task["file_name"] = send_name
-        save_processing(task)
+        if safe_mode:
+            update_telegram_status(
+                task,
+                stage="🔐 Creating Safe Mode Archive",
+                upload_status=(
+                    "Creating a password-protected 7-Zip archive before upload."
+                ),
+            )
 
-        upload_file_with_optional_splitting(
-            task,
-            settings["rubika_session"],
-            settings["rubika_target"],
-            str(send_path),
-            caption,
-            send_name,
-        )
+            safe_mode_parts = create_safe_mode_package(
+                str(original_path),
+                safe_mode_password,
+            )
+
+            # Keep the original file until the encrypted upload succeeds.
+            # This allows a failed Safe Mode upload to be retried.
+
+            task["file_name"] = send_name
+            save_processing(task)
+
+            update_telegram_status(
+                task,
+                stage="📤 Upload Queue",
+                upload_status=(
+                    f"Safe Mode archive created. "
+                    f"Preparing the encrypted archive for upload to "
+                    f"{format_destination_label(settings)}."
+                ),
+            )
+        else:
+            task["file_name"] = send_name
+            save_processing(task)
+
+            update_telegram_status(
+                task,
+                stage="📤 Upload Queue",
+                upload_status=f"Preparing the file for upload to {format_destination_label(settings)}.",
+            )
+
+        if safe_mode:
+            upload_safe_mode_package(
+                task,
+                settings["rubika_session"],
+                settings["rubika_target"],
+                safe_mode_parts,
+                caption,
+            )
+        else:
+            upload_file_with_optional_splitting(
+                task,
+                settings["rubika_session"],
+                settings["rubika_target"],
+                str(send_path),
+                caption,
+                send_name,
+            )
     except CancelledTaskError:
-        if not split_upload:
+        if safe_mode:
+            # Remove temporary encrypted archive files.
+            # Keep the original file for retry.
+            for part_path in safe_mode_parts:
+                cleanup_local_file(part_path)
+        elif not split_upload:
             cleanup_local_file(str(send_path))
+
         clear_cancelled(task_id)
         update_telegram_status(
             task,
@@ -805,10 +1036,24 @@ def process_task(task: dict) -> None:
         )
         return
     except Exception:
+        if safe_mode:
+            # Remove temporary encrypted archive files.
+            # Keep the original file for retry.
+            for part_path in safe_mode_parts:
+                cleanup_local_file(part_path)
         clear_cancelled(task_id)
         raise
 
-    cleanup_local_file(str(send_path))
+    if safe_mode:
+        # Upload succeeded. Now it is safe to remove the original
+        # file and the temporary encrypted archive/volumes.
+        cleanup_local_file(str(original_path))
+
+        for part_path in safe_mode_parts:
+            cleanup_local_file(part_path)
+    else:
+        cleanup_local_file(str(send_path))
+
     clear_cancelled(task_id)
     task["upload_percent"] = 100
     task["speed_text"] = None
@@ -840,7 +1085,10 @@ def recover_cancelled_processing_task() -> None:
 
     task_path = Path(task.get("path", ""))
 
-    if task_path.exists() and task_path.stat().st_size > MAX_RUBIKA_FILE_SIZE:
+    if task.get("safe_mode"):
+        cleanup_split_parts(str(task_path))
+        cleanup_local_file(str(task_path))
+    elif task_path.exists() and task_path.stat().st_size > MAX_RUBIKA_FILE_SIZE:
         cleanup_split_parts(str(task_path))
     else:
         cleanup_local_file(str(task_path))

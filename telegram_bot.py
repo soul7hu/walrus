@@ -83,6 +83,7 @@ app = Client(
 ACTIVE_DOWNLOADS: dict[str, dict] = {}
 COMMANDS_READY = False
 AUTH_SETUPS: dict[int, dict] = {}
+SAFE_MODE_INPUTS: dict[int, dict] = {}
 CHANNEL_CHOICES: dict[int, dict[str, dict]] = {}
 BASE_DIR = Path(__file__).resolve().parent
 RUBIKA_AUTH_HELPER = BASE_DIR / "rubika_auth_helper.py"
@@ -328,6 +329,7 @@ def settings_action_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("📱 Change Account", callback_data="settings:session")],
             [InlineKeyboardButton("📬 Destination", callback_data="settings:destination")],
+            [InlineKeyboardButton("🛡 Safe Mode", callback_data="settings:safe_mode")],
         ]
     )
 
@@ -338,6 +340,21 @@ def destination_action_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("☁️ Saved Messages", callback_data="destination:saved")],
             [InlineKeyboardButton("📣 Choose Channel", callback_data="destination:channels")],
             [InlineKeyboardButton("↩️ Back", callback_data="destination:back")],
+        ]
+    )
+
+
+def safe_mode_action_keyboard() -> InlineKeyboardMarkup:
+    settings = load_runtime_settings()
+    safe_mode = bool(settings.get("safe_mode"))
+
+    toggle_label = "🔴 Disable Safe Mode" if safe_mode else "🟢 Enable Safe Mode"
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(toggle_label, callback_data="safe_mode:toggle")],
+            [InlineKeyboardButton("🔐 Password Settings", callback_data="safe_mode:password")],
+            [InlineKeyboardButton("↩ Back", callback_data="safe_mode:back")],
         ]
     )
 
@@ -368,6 +385,7 @@ def auth_setup_keyboard() -> InlineKeyboardMarkup:
 def build_settings_text(note: str | None = None) -> str:
     settings = load_settings_with_phone()
     active_phone = settings.get("rubika_phone") or "Not set"
+    safe_mode_status = "ON" if settings.get("safe_mode") else "OFF"
     lines = [
         "<b>⚙️ Rubika Settings</b>",
         "",
@@ -376,6 +394,7 @@ def build_settings_text(note: str | None = None) -> str:
         f"📱 <b>Current Account:</b> {ltr_code(settings['rubika_session'])}",
         f"☎️ <b>Active Phone:</b> {ltr_code(active_phone)}",
         f"📬 <b>Upload Destination:</b> {ltr_code(format_destination_label(settings))}",
+        f"🛡 <b>Safe Mode:</b> {ltr_code(safe_mode_status)}",
     ]
 
     lines.extend(
@@ -431,6 +450,56 @@ def build_destination_text(note: str | None = None) -> str:
         lines.extend(["", note])
 
     return "\n".join(lines)
+
+
+def build_safe_mode_text(note: str | None = None) -> str:
+    settings = load_runtime_settings()
+    safe_mode = bool(settings.get("safe_mode"))
+    has_password = bool(settings.get("safe_mode_password"))
+
+    status = "ON" if safe_mode else "OFF"
+    password_status = "Configured" if has_password else "Not configured"
+
+    lines = [
+        "<b>🛡 Safe Mode</b>",
+        "",
+        f"Status: <b>{status}</b>",
+        f"🔐 Password: <b>{password_status}</b>",
+        "",
+        "When Safe Mode is enabled, files are packaged into a password-protected 7-Zip archive before upload.",
+        "Large archives can be split into Rubika-compatible volumes.",
+        "",
+        "Safe Mode always packages the file; it does not first attempt a normal upload.",
+    ]
+
+    if note:
+        lines.extend(["", note])
+
+    return "\n".join(lines)
+
+
+async def send_safe_mode_panel(message: Message, note: str | None = None) -> None:
+    await message.reply_text(
+        build_safe_mode_text(note),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=safe_mode_action_keyboard(),
+    )
+
+
+async def prompt_safe_mode_password(message: Message) -> None:
+    SAFE_MODE_INPUTS[message.chat.id] = {
+        "stage": "await_password",
+    }
+
+    await message.reply_text(
+        "🔐 <b>Safe Mode Password</b>\n\n"
+        "Send the password you want to use for Safe Mode 7-Zip archives.\n\n"
+        "⚠️ The password will not be shown in the bot's status messages.",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("↩ Cancel", callback_data="safe_mode:back")]]
+        ),
+    )
 
 
 async def send_destination_panel(message: Message, note: str | None = None) -> None:
@@ -943,6 +1012,43 @@ async def maybe_handle_auth_input(message: Message) -> bool:
             message,
             text,
             "⏳ Sending Rubika verification input...",
+        )
+        return True
+
+    return False
+
+
+async def maybe_handle_safe_mode_input(message: Message) -> bool:
+    state = SAFE_MODE_INPUTS.get(message.chat.id)
+    if not state:
+        return False
+
+    text = (message.text or "").strip()
+
+    if not text or text.startswith("/") or text in MENU_BUTTONS:
+        return False
+
+    if state.get("stage") == "await_password":
+        if len(text) < 4:
+            await message.reply_text(
+                "⚠️ Password must be at least 4 characters. Please send it again."
+            )
+            return True
+
+        settings = load_runtime_settings()
+        settings["safe_mode_password"] = text
+        save_runtime_settings(settings)
+
+        SAFE_MODE_INPUTS.pop(message.chat.id, None)
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        await send_safe_mode_panel(
+            message,
+            note="✅ Safe Mode password saved.",
         )
         return True
 
@@ -2286,6 +2392,44 @@ async def settings_callback_handler(client: Client, callback_query: CallbackQuer
         await prompt_rubika_phone_setup(callback_query.message)
     elif action == "destination":
         await send_destination_panel(callback_query.message)
+    elif action == "safe_mode":
+        await send_safe_mode_panel(callback_query.message)
+
+
+@app.on_callback_query(filters.regex(r"^safe_mode:"))
+async def safe_mode_callback_handler(client: Client, callback_query: CallbackQuery):
+    if not await ensure_authorized_callback(callback_query):
+        return
+
+    parts = (callback_query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "back":
+        SAFE_MODE_INPUTS.pop(callback_query.message.chat.id, None)
+        await callback_query.answer()
+        await send_settings_panel(callback_query.message)
+        return
+
+    if action == "toggle":
+        settings = load_runtime_settings()
+        settings["safe_mode"] = not bool(settings.get("safe_mode"))
+        save_runtime_settings(settings)
+
+        status = "enabled" if settings["safe_mode"] else "disabled"
+        await callback_query.answer(f"Safe Mode {status}.")
+
+        await send_safe_mode_panel(
+            callback_query.message,
+            note=f"✅ Safe Mode {status}.",
+        )
+        return
+
+    if action == "password":
+        await callback_query.answer()
+        await prompt_safe_mode_password(callback_query.message)
+        return
+
+    await callback_query.answer("Unknown Safe Mode action.", show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r"^destination:"))
@@ -2707,6 +2851,9 @@ async def direct_file_url_handler(_client: Client, message: Message):
 
     text = (message.text or "").strip()
     if await maybe_handle_auth_input(message):
+        return
+
+    if await maybe_handle_safe_mode_input(message):
         return
 
     if not text or text in MENU_BUTTONS or text.startswith("/"):
