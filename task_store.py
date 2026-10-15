@@ -308,6 +308,7 @@ def normalize_runtime_settings(settings: Optional[dict] = None) -> dict:
 
     safe_mode = bool(settings.get("safe_mode", False))
     safe_mode_password = str(settings.get("safe_mode_password") or "").strip()
+    archive_randomize = bool(settings.get("archive_randomize", False))
 
     return {
         "rubika_session": rubika_session,
@@ -317,6 +318,7 @@ def normalize_runtime_settings(settings: Optional[dict] = None) -> dict:
         "rubika_target_type": rubika_target_type,
         "safe_mode": safe_mode,
         "safe_mode_password": safe_mode_password,
+        "archive_randomize": archive_randomize,
     }
 
 
@@ -344,6 +346,7 @@ def save_runtime_settings(settings: dict) -> dict:
         "rubika_target_type": normalized["rubika_target_type"],
         "safe_mode": normalized["safe_mode"],
         "safe_mode_password": normalized["safe_mode_password"],
+        "archive_randomize": normalized["archive_randomize"],
     }
     temp_path = SETTINGS_FILE.with_suffix(".tmp")
     temp_path.write_text(
@@ -362,6 +365,7 @@ def apply_runtime_settings(task: dict, settings: Optional[dict] = None) -> dict:
     task["rubika_target_title"] = runtime_settings["rubika_target_title"]
     task["rubika_target_type"] = runtime_settings["rubika_target_type"]
     task["safe_mode"] = runtime_settings["safe_mode"]
+    task["archive_randomize"] = runtime_settings["archive_randomize"]
     return task
 
 

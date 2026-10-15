@@ -330,6 +330,7 @@ def settings_action_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📱 Change Account", callback_data="settings:session")],
             [InlineKeyboardButton("📬 Destination", callback_data="settings:destination")],
             [InlineKeyboardButton("🛡 Safe Mode", callback_data="settings:safe_mode")],
+            [InlineKeyboardButton("📦 Archive & Randomize Filename", callback_data="settings:archive_randomize")],
         ]
     )
 
@@ -386,6 +387,7 @@ def build_settings_text(note: str | None = None) -> str:
     settings = load_settings_with_phone()
     active_phone = settings.get("rubika_phone") or "Not set"
     safe_mode_status = "ON" if settings.get("safe_mode") else "OFF"
+    archive_randomize_status = "ON" if settings.get("archive_randomize") else "OFF"
     lines = [
         "<b>⚙️ Rubika Settings</b>",
         "",
@@ -395,6 +397,7 @@ def build_settings_text(note: str | None = None) -> str:
         f"☎️ <b>Active Phone:</b> {ltr_code(active_phone)}",
         f"📬 <b>Upload Destination:</b> {ltr_code(format_destination_label(settings))}",
         f"🛡 <b>Safe Mode:</b> {ltr_code(safe_mode_status)}",
+        f"📦 <b>Archive & Randomize Filename:</b> {ltr_code(archive_randomize_status)}",
     ]
 
     lines.extend(
@@ -483,6 +486,51 @@ async def send_safe_mode_panel(message: Message, note: str | None = None) -> Non
         build_safe_mode_text(note),
         parse_mode=enums.ParseMode.HTML,
         reply_markup=safe_mode_action_keyboard(),
+    )
+
+
+def archive_randomize_action_keyboard() -> InlineKeyboardMarkup:
+    settings = load_runtime_settings()
+    enabled = bool(settings.get("archive_randomize"))
+    label = "🔴 Disable Archive & Randomize" if enabled else "🟢 Enable Archive & Randomize"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(label, callback_data="archive_randomize:toggle")],
+            [InlineKeyboardButton("↩ Back", callback_data="archive_randomize:back")],
+        ]
+    )
+
+
+def build_archive_randomize_text(note: str | None = None) -> str:
+    settings = load_runtime_settings()
+    enabled = bool(settings.get("archive_randomize"))
+    safe_mode = bool(settings.get("safe_mode"))
+    status = "ON" if enabled else "OFF"
+    protection = (
+        "Because Safe Mode is ON, these archives will also be password-protected."
+        if safe_mode
+        else "With Safe Mode OFF, archives will not be password-protected."
+    )
+    lines = [
+        "<b>📦 Archive & Randomize Filename</b>",
+        "",
+        f"Status: <b>{status}</b>",
+        "",
+        "When enabled, files are packaged into a 7-Zip archive with a random outer filename before upload.",
+        protection,
+        "Large archives can be split into parts to respect the configured upload-size limit.",
+        "The original file is kept until the archive upload succeeds.",
+    ]
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)
+
+
+async def send_archive_randomize_panel(message: Message, note: str | None = None) -> None:
+    await message.reply_text(
+        build_archive_randomize_text(note),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=archive_randomize_action_keyboard(),
     )
 
 
@@ -2394,6 +2442,36 @@ async def settings_callback_handler(client: Client, callback_query: CallbackQuer
         await send_destination_panel(callback_query.message)
     elif action == "safe_mode":
         await send_safe_mode_panel(callback_query.message)
+    elif action == "archive_randomize":
+        await send_archive_randomize_panel(callback_query.message)
+
+
+@app.on_callback_query(filters.regex(r"^archive_randomize:"))
+async def archive_randomize_callback_handler(client: Client, callback_query: CallbackQuery):
+    if not await ensure_authorized_callback(callback_query):
+        return
+
+    parts = (callback_query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "back":
+        await callback_query.answer()
+        await send_settings_panel(callback_query.message)
+        return
+
+    if action == "toggle":
+        settings = load_runtime_settings()
+        settings["archive_randomize"] = not bool(settings.get("archive_randomize"))
+        save_runtime_settings(settings)
+        status = "enabled" if settings["archive_randomize"] else "disabled"
+        await callback_query.answer(f"Archive & Randomize {status}.")
+        await send_archive_randomize_panel(
+            callback_query.message,
+            note=f"✅ Archive & Randomize {status}.",
+        )
+        return
+
+    await callback_query.answer("Unknown archive setting.", show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r"^safe_mode:"))
